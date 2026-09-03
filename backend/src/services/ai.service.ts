@@ -13,7 +13,7 @@ dotenv.config({ override: true })
 // AI_PROVIDER selects the chat backend: 'gemini' (default) or 'anthropic'.
 // Both tool sets and prompts are shared — only the model call loop differs.
 const AI_PROVIDER = (process.env.AI_PROVIDER || 'gemini').toLowerCase()
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash'
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash'
 const ANTHROPIC_MODEL = 'claude-sonnet-4-20250514'
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
