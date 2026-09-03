@@ -1,46 +1,26 @@
-import type { WalletData, TokenBalance, NativeBalance, ChainBreakdown, Transaction, NFT } from '../types/index.js'
-import {
-  attachTokenMeta,
-  buildTransactionDescription,
-  classifyActivity,
-  collectRawTransferLegs,
-  computeFeeEthAndUsd,
-  parseWeiField,
-  type TokenMeta,
-} from '../utils/transaction-decode.js'
-import { formatEther, getAddress } from 'viem'
+import type {
+  WalletData,
+  TokenBalance,
+  NativeBalance,
+  ChainBreakdown,
+  Transaction,
+  DecodedTransfer,
+  NFT,
+} from '../types/index.js'
+import { buildTransactionDescription, classifyActivity } from '../utils/transaction-decode.js'
+import { getAddress } from 'viem'
 import dotenv from 'dotenv'
 
 dotenv.config()
 
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY ?? ''
-const DUNE_SIM_API_KEY = process.env.DUNE_SIM_API_KEY ?? ''
 const ZERION_API_KEY = process.env.ZERION_API_KEY ?? ''
 const MORALIS_BASE = 'https://deep-index.moralis.io/api/v2.2'
-const DUNE_SIM_BASE = 'https://api.sim.dune.com/v1/evm'
 const ZERION_BASE = 'https://api.zerion.io'
 
 const NATIVE_ETH_PLACEHOLDER = '0x0000000000000000000000000000000000000000' as const
 
-// ─── Dune chain display name mapping (transactions only) ────────────────────
-
-const DUNE_CHAIN_DISPLAY: Record<string, string> = {
-  ethereum:    'Ethereum',
-  polygon:     'Polygon',
-  bsc:         'BSC',
-  arbitrum:    'Arbitrum',
-  optimism:    'Optimism',
-  base:        'Base',
-  avalanche_c: 'Avalanche',
-  avalanche:   'Avalanche',
-  gnosis:      'Gnosis',
-  scroll:      'Scroll',
-  linea:       'Linea',
-  zksync:      'zkSync',
-  mantle:      'Mantle',
-}
-
-// ─── Zerion chain slug mapping (balances) ────────────────────────────────────
+// ─── Zerion chain slug mapping ────────────────────────────────────────────────
 // Zerion identifies chains by slug rather than numeric chain_id.
 // https://developers.zerion.io/reference/listwalletpositions
 
@@ -56,13 +36,6 @@ const ZERION_CHAIN: Record<string, { chainId: number; display: string }> = {
 
 const ZERION_CHAIN_SLUGS = Object.keys(ZERION_CHAIN).join(',')
 
-
-function chunk<T>(arr: T[], size: number): T[][] {
-  const out: T[][] = []
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
-  return out
-}
-
 // ─── Moralis helpers (balance, tokens, NFTs, metadata) ──────────────────────
 
 async function moralisFetch(path: string) {
@@ -77,21 +50,7 @@ async function moralisFetch(path: string) {
   return res.json()
 }
 
-// ─── Dune SIM helpers (transactions) ────────────────────────────────────────
-
-async function duneFetch(path: string): Promise<any> {
-  if (!DUNE_SIM_API_KEY) throw new Error('DUNE_SIM_API_KEY not set')
-  const res = await fetch(`${DUNE_SIM_BASE}${path}`, {
-    headers: { 'X-Sim-Api-Key': DUNE_SIM_API_KEY, accept: 'application/json' },
-  })
-  if (!res.ok) {
-    const txt = await res.text()
-    throw new Error(`Dune SIM ${path}: ${res.status} ${txt}`)
-  }
-  return res.json()
-}
-
-// ─── Zerion helpers (balances) ───────────────────────────────────────────────
+// ─── Zerion helpers ───────────────────────────────────────────────────────────
 // Zerion uses HTTP Basic auth: base64("<api-key>:") — no password.
 
 async function zerionFetch(path: string): Promise<any> {
@@ -196,100 +155,63 @@ async function getZerionBalances(address: string): Promise<{
   }
 }
 
-// ─── Transactions (decode via ../utils/transaction-decode.ts) ─────────────────
-
-async function fetchTokenMetadataMap(addresses: string[]): Promise<Map<string, TokenMeta>> {
-  const map = new Map<string, TokenMeta>()
-  if (addresses.length === 0) return map
-
-  for (const group of chunk(addresses, 20)) {
-    const params = new URLSearchParams({ chain: 'eth' })
-    let appended = 0
-    for (const a of group) {
-      try {
-        params.append('addresses', getAddress(a as `0x${string}`))
-        appended++
-      } catch {
-        continue
-      }
-    }
-    if (appended === 0) continue
-
-    try {
-      const data = await moralisFetch(`/erc20/metadata?${params.toString()}`)
-      const arr = Array.isArray(data) ? data : []
-      for (const t of arr) {
-        const addr = (t.token_address ?? t.address ?? '') as string
-        if (!addr) continue
-        const key = addr.toLowerCase()
-        map.set(key, {
-          symbol: (t.symbol as string) ?? '?',
-          name: (t.name as string) ?? (t.symbol as string) ?? 'Unknown',
-          decimals: parseInt(String(t.decimals ?? '18'), 10) || 18,
-          logo: t.logo as string | undefined,
-        })
-      }
-    } catch {
-      /* non-fatal */
-    }
-  }
-  return map
-}
+// ─── Transactions (Zerion) ────────────────────────────────────────────────────
+// Zerion's transactions endpoint returns already-classified transfers with
+// token metadata embedded — no raw-log decoding or separate metadata lookup
+// needed. https://developers.zerion.io/reference/listwallettransactions
 
 /**
- * Build a normalised Transaction from a Dune SIM transaction row.
- * Dune fields: from, to, data (calldata), value (hex), gas_used (hex),
- * gas_price (hex), effective_gas_price (hex), success (bool), block_time (ISO).
- * Logs are already embedded: [{ address, data, topics[] }]
+ * Build a normalised Transaction from a Zerion transaction row.
  */
-function buildTransactionFromDune(
-  row: any,
-  walletLower: string,
-  ethPrice: number,
-  metaMap: Map<string, TokenMeta>
-): Transaction {
-  const tx = row as Record<string, unknown>
+function buildTransactionFromZerion(row: any, walletLower: string, ethPrice: number): Transaction {
+  const attr = row.attributes ?? {}
+  const chainSlug: string | undefined = row.relationships?.chain?.data?.id
 
-  const hash = tx.hash as string
-  const from = (tx.from as string) ?? ''
-  const to = (tx.to as string) ?? ''
-  const fromL = from.toLowerCase()
-  const toL = to.toLowerCase()
+  const hash = attr.hash as string
+  const from = (attr.sent_from as string) ?? ''
+  const to = (attr.sent_to as string) ?? ''
 
-  const valueWei = parseWeiField(tx.value)
-  const valueEth = Number(valueWei) / 1e18
+  const rawTransfers: any[] = attr.transfers ?? []
+  const transfers: DecodedTransfer[] = []
+  let valueEth = 0
 
-  // Dune logs are already clean — normalizeTxLogs picks them up via `tx.logs`
-  const rawTokenLegs = collectRawTransferLegs(tx, walletLower)
-  const transfers = rawTokenLegs.map((r) => attachTokenMeta(r, metaMap))
+  for (const t of rawTransfers) {
+    const fungible = t.fungible_info
+    if (!fungible) continue // skip NFT legs — not decoded here
 
-  if (valueWei > 0n) {
-    const direction: 'in' | 'out' = fromL === walletLower ? 'out' : toL === walletLower ? 'in' : 'out'
-    transfers.unshift({
-      tokenAddress: getAddress(NATIVE_ETH_PLACEHOLDER),
-      symbol: 'ETH',
-      name: 'Ethereum',
-      decimals: 18,
-      from,
-      to,
-      amountRaw: valueWei.toString(),
-      amountFormatted: formatEther(valueWei),
+    const impls = fungible.implementations ?? []
+    const impl = impls.find((i: any) => i.chain_id === chainSlug) ?? impls[0]
+    const tokenAddress: string = impl?.address || 'native'
+    const decimals: number = t.quantity?.decimals ?? impl?.decimals ?? 18
+    const amountFormatted: string = t.quantity?.numeric ?? String(t.quantity?.float ?? 0)
+    const direction: 'in' | 'out' = t.direction === 'out' ? 'out' : 'in'
+    const isNative = tokenAddress === 'native'
+
+    if (isNative) valueEth += Number(t.quantity?.float ?? 0) * (direction === 'out' ? 1 : 1)
+
+    transfers.push({
+      tokenAddress: isNative ? getAddress(NATIVE_ETH_PLACEHOLDER) : tokenAddress,
+      symbol: fungible.symbol ?? '?',
+      name: fungible.name ?? fungible.symbol ?? 'Unknown',
+      decimals,
+      logo: fungible.icon?.url ?? undefined,
+      from: t.sender ?? from,
+      to: t.recipient ?? to,
+      amountRaw: t.quantity?.int ?? '0',
+      amountFormatted,
       direction,
     })
   }
 
-  const activityType = classifyActivity(transfers, tx)
-  const { feeNativeEth, feeUsd } = computeFeeEthAndUsd(tx, tx, ethPrice)
-  const description = buildTransactionDescription(activityType, transfers, feeNativeEth, feeUsd)
+  const activityType = classifyActivity(transfers, attr)
+  const description = buildTransactionDescription(activityType, transfers, undefined, undefined)
 
-  const ts = tx.block_time as string | undefined
-  const timestamp = ts ? new Date(ts).getTime() : Date.now()
+  const timestamp = attr.mined_at ? new Date(attr.mined_at as string).getTime() : Date.now()
+  const status: 'success' | 'failed' = attr.status === 'confirmed' ? 'success' : 'failed'
 
-  const status: 'success' | 'failed' = tx.success === true ? 'success' : 'failed'
-
-  // Dune: gas_used / gas_price are hex strings — convert to decimal strings for display
-  const gasUsedBig = parseWeiField(tx.gas_used)
-  const gasPriceBig = parseWeiField(tx.gas_price)
+  const feeNativeEth: number | undefined = attr.fee?.quantity?.float ?? undefined
+  const feeUsd: number | undefined =
+    attr.fee?.value ?? (feeNativeEth != null ? feeNativeEth * ethPrice : undefined)
 
   return {
     hash,
@@ -299,8 +221,8 @@ function buildTransactionFromDune(
     valueUsd: valueEth * ethPrice,
     timestamp,
     description,
-    gasUsed: gasUsedBig > 0n ? gasUsedBig.toString() : undefined,
-    gasPrice: gasPriceBig > 0n ? gasPriceBig.toString() : undefined,
+    gasUsed: undefined,
+    gasPrice: undefined,
     status,
     method: undefined,
     activityType,
@@ -310,52 +232,28 @@ function buildTransactionFromDune(
   }
 }
 
-async function decodeDuneTxBatch(
-  rows: any[],
-  walletLower: string,
-  ethPrice: number
-): Promise<Transaction[]> {
-  if (rows.length === 0) return []
-
-  // Dune already embeds logs in each row — no per-tx verbose fetch needed.
-  const tokenAddrs = new Set<string>()
-  for (const row of rows) {
-    for (const leg of collectRawTransferLegs(row as Record<string, unknown>, walletLower)) {
-      tokenAddrs.add(leg.tokenAddress.toLowerCase())
-    }
-  }
-
-  const metaMap = await fetchTokenMetadataMap([...tokenAddrs])
-  return rows.map((row) => buildTransactionFromDune(row, walletLower, ethPrice, metaMap))
-}
-
-async function getTransactions(address: string, ethPrice: number): Promise<Transaction[]> {
-  try {
-    const qs = new URLSearchParams({ limit: '20', decode: 'false' })
-    const data = await duneFetch(`/transactions/${address}?${qs}`)
-    const rows = (data?.transactions ?? []) as any[]
-    return decodeDuneTxBatch(rows, address.toLowerCase(), ethPrice)
-  } catch (err: any) {
-    console.error('[getTransactions]', err.message)
-    return []
-  }
-}
-
 export async function getTransactionsPaged(
   address: string,
   ethPrice: number,
-  offset?: string,
+  cursor?: string,
   limit = 10
 ): Promise<{ transactions: Transaction[]; nextCursor: string | null; hasMore: boolean }> {
-  const qs = new URLSearchParams({ limit: String(limit), decode: 'false' })
-  if (offset) qs.set('offset', offset)
+  const qs = new URLSearchParams({
+    currency: 'usd',
+    'filter[chain_ids]': ZERION_CHAIN_SLUGS,
+    'page[size]': String(limit),
+  })
+  if (cursor) qs.set('page[after]', cursor)
 
-  const data = await duneFetch(`/transactions/${address}?${qs}`)
-  const rows = (data?.transactions ?? []) as any[]
-  const nextCursor = (data?.next_offset as string | undefined) ?? null
-  const hasMore = Boolean(nextCursor && rows.length === limit)
+  const data = await zerionFetch(`/v1/wallets/${address}/transactions/?${qs}`)
+  const rows = (data?.data ?? []) as any[]
 
-  const transactions = await decodeDuneTxBatch(rows, address.toLowerCase(), ethPrice)
+  const nextLink: string | undefined = data?.links?.next
+  const nextCursor = nextLink ? new URL(nextLink).searchParams.get('page[after]') : null
+  const hasMore = Boolean(nextCursor)
+
+  const walletLower = address.toLowerCase()
+  const transactions = rows.map((row) => buildTransactionFromZerion(row, walletLower, ethPrice))
   return { transactions, nextCursor, hasMore }
 }
 
@@ -429,8 +327,13 @@ export async function fetchWalletData(address: string): Promise<WalletData> {
 
   const { nativeBalances, tokens, ethPriceUsd } = balanceData
 
-  // Fetch transactions (Dune SIM) with the live ETH price from Zerion
-  const transactions = await getTransactions(address, ethPriceUsd)
+  // Fetch transactions with the live ETH price from Zerion
+  const transactions = await getTransactionsPaged(address, ethPriceUsd, undefined, 20)
+    .then((r) => r.transactions)
+    .catch((err: any) => {
+      console.error('[getTransactionsPaged]', err.message)
+      return []
+    })
 
   // Ethereum mainnet native balance (for backward compat fields)
   const ethNative = nativeBalances.find(n => n.chainId === 1)
