@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk'
 import type { MessageParam, Tool, ToolResultBlockParam } from '@anthropic-ai/sdk/resources/messages'
+import { GoogleGenAI } from '@google/genai'
 import type { ChatMessage, ChatResponse, SendTxIntent, MarketContext, WalletData } from '../types/index.js'
 import { fetchMarketContext } from './market.service.js'
 import { isValidEvmAddress, isPositiveDecimal } from '../utils/tx-builder.js'
@@ -9,7 +10,14 @@ import dotenv from 'dotenv'
 
 dotenv.config({ override: true })
 
+// AI_PROVIDER selects the chat backend: 'gemini' (default) or 'anthropic'.
+// Both tool sets and prompts are shared — only the model call loop differs.
+const AI_PROVIDER = (process.env.AI_PROVIDER || 'gemini').toLowerCase()
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash'
+const ANTHROPIC_MODEL = 'claude-sonnet-4-20250514'
+
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+const geminiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
 
 const GET_WALLET_SUMMARY_TOOL = {
   name: 'get_wallet_summary',
@@ -136,28 +144,28 @@ function compactMarket(m: MarketContext): object {
   }
 }
 
-// ─── Parse transaction intent from tool use ───────────────────────────────────
-function parseToolTxIntent(content: unknown[]): SendTxIntent | undefined {
-  const toolUse = content.find(
-    (block: any) =>
-      block?.type === 'tool_use' && (block?.name === 'send_eth' || block?.name === 'send_token')
-  ) as any
+// ─── Parse transaction intent from a tool/function call ───────────────────────
+// Provider-agnostic: both Anthropic tool_use blocks and Gemini functionCalls
+// are normalised to { name, input } before reaching this.
 
-  if (!toolUse?.input || typeof toolUse.input !== 'object') return undefined
-  const input = toolUse.input as Record<string, unknown>
+type ToolCall = { name: string; input: unknown }
 
-  const to = typeof input.to === 'string' ? input.to.trim() : ''
-  const amount = typeof input.amount === 'string' ? input.amount.trim() : ''
-  const reason = typeof input.reason === 'string' ? input.reason.trim() : ''
+function buildSendIntentFromCall(name: string, input: unknown): SendTxIntent | undefined {
+  if (!input || typeof input !== 'object') return undefined
+  const obj = input as Record<string, unknown>
+
+  const to = typeof obj.to === 'string' ? obj.to.trim() : ''
+  const amount = typeof obj.amount === 'string' ? obj.amount.trim() : ''
+  const reason = typeof obj.reason === 'string' ? obj.reason.trim() : ''
 
   if (!isValidEvmAddress(to) || !isPositiveDecimal(amount)) return undefined
 
-  if (toolUse.name === 'send_token') {
-    const tokenAddress = typeof input.tokenAddress === 'string' ? input.tokenAddress.trim() : ''
-    const tokenSymbol = typeof input.tokenSymbol === 'string' ? input.tokenSymbol.trim() : '?'
-    const tokenName = typeof input.tokenName === 'string' ? input.tokenName.trim() : tokenSymbol
-    const decimals = typeof input.decimals === 'number' ? input.decimals : 18
-    const chainId = typeof input.chainId === 'number' ? input.chainId : 1
+  if (name === 'send_token') {
+    const tokenAddress = typeof obj.tokenAddress === 'string' ? obj.tokenAddress.trim() : ''
+    const tokenSymbol = typeof obj.tokenSymbol === 'string' ? obj.tokenSymbol.trim() : '?'
+    const tokenName = typeof obj.tokenName === 'string' ? obj.tokenName.trim() : tokenSymbol
+    const decimals = typeof obj.decimals === 'number' ? obj.decimals : 18
+    const chainId = typeof obj.chainId === 'number' ? obj.chainId : 1
 
     if (!isValidEvmAddress(tokenAddress)) return undefined
 
@@ -174,7 +182,7 @@ function parseToolTxIntent(content: unknown[]): SendTxIntent | undefined {
     }
   }
 
-  const chainId = typeof input.chainId === 'number' ? input.chainId : 1
+  const chainId = typeof obj.chainId === 'number' ? obj.chainId : 1
   return {
     type: 'SEND_ETH',
     to,
@@ -182,6 +190,11 @@ function parseToolTxIntent(content: unknown[]): SendTxIntent | undefined {
     chainId,
     reason: reason || 'User requested ETH transfer',
   }
+}
+
+function parseToolTxIntent(calls: ToolCall[]): SendTxIntent | undefined {
+  const call = calls.find((c) => c.name === 'send_eth' || c.name === 'send_token')
+  return call ? buildSendIntentFromCall(call.name, call.input) : undefined
 }
 
 async function runWalletTool(
@@ -222,7 +235,41 @@ async function runWalletTool(
   }
 }
 
-export async function chat(
+/** Runs a wallet/market tool by name, shared across providers. */
+async function executeToolCall(
+  name: string,
+  input: unknown,
+  wallet: WalletData,
+  snapshotIso: string,
+  onSendIntent: (intent: SendTxIntent) => void
+): Promise<string> {
+  if (name === 'get_market_context') {
+    const market = await fetchMarketContext(wallet)
+    return JSON.stringify(compactMarket(market))
+  }
+  if (name === 'get_wallet_summary' || name === 'get_token_holdings' || name === 'get_recent_transactions') {
+    return runWalletTool(name, input, wallet, snapshotIso)
+  }
+  if (name === 'send_eth' || name === 'send_token') {
+    const intent = buildSendIntentFromCall(name, input)
+    if (intent) onSendIntent(intent)
+    return JSON.stringify({ ok: true, note: 'Transfer intent recorded; user will confirm in the app.' })
+  }
+  return JSON.stringify({ error: `Unknown tool: ${name}` })
+}
+
+function finalReply(text: string, txIntent: SendTxIntent | undefined): ChatResponse {
+  const fallbackReply = txIntent
+    ? txIntent.type === 'SEND_TOKEN'
+      ? `Ready to send ${txIntent.amount} ${txIntent.tokenSymbol} to ${txIntent.to}. Please confirm.`
+      : `Ready to send ${txIntent.amount} ETH to ${txIntent.to}. Please confirm.`
+    : ''
+  return { reply: text || fallbackReply, txIntent }
+}
+
+// ─── Anthropic (Claude) provider ───────────────────────────────────────────────
+
+async function chatWithAnthropic(
   messages: ChatMessage[],
   wallet: WalletData,
   snapshotUpdatedAt: Date
@@ -235,20 +282,23 @@ export async function chat(
     content: m.content,
   }))
 
-  let lastContent: unknown[] = []
+  let lastCalls: ToolCall[] = []
   let pendingSendIntent: SendTxIntent | undefined
   const maxRounds = 8
 
   for (let round = 0; round < maxRounds; round++) {
     const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: ANTHROPIC_MODEL,
       max_tokens: 2048,
       system: systemPrompt,
       messages: apiMessages,
       tools: ALL_TOOLS,
     })
 
-    lastContent = response.content as unknown[]
+    const toolUses = (response.content as Array<{ type: string; id?: string; name?: string; input?: unknown }>).filter(
+      (b) => b.type === 'tool_use'
+    )
+    lastCalls = toolUses.map((tu) => ({ name: tu.name ?? '', input: tu.input }))
 
     if (response.stop_reason !== 'tool_use') {
       const reply = (response.content as Array<{ type: string; text?: string }>)
@@ -257,17 +307,7 @@ export async function chat(
         .join('')
         .trim()
 
-      const txIntent = parseToolTxIntent(lastContent) ?? pendingSendIntent
-      const fallbackReply = txIntent
-        ? txIntent.type === 'SEND_TOKEN'
-          ? `Ready to send ${txIntent.amount} ${txIntent.tokenSymbol} to ${txIntent.to}. Please confirm.`
-          : `Ready to send ${txIntent.amount} ETH to ${txIntent.to}. Please confirm.`
-        : ''
-
-      return {
-        reply: reply || fallbackReply,
-        txIntent,
-      }
+      return finalReply(reply, parseToolTxIntent(lastCalls) ?? pendingSendIntent)
     }
 
     apiMessages.push({
@@ -275,35 +315,15 @@ export async function chat(
       content: response.content as MessageParam['content'],
     })
 
-    const toolUses = (response.content as Array<{ type: string; id?: string; name?: string; input?: unknown }>).filter(
-      (b) => b.type === 'tool_use'
-    )
-
     const results: ToolResultBlockParam[] = []
 
     for (const tu of toolUses) {
       const id = tu.id ?? ''
       const name = tu.name ?? ''
       try {
-        let out: string
-        if (name === 'get_market_context') {
-          const market = await fetchMarketContext(wallet)
-          out = JSON.stringify(compactMarket(market))
-        } else if (
-          name === 'get_wallet_summary' ||
-          name === 'get_token_holdings' ||
-          name === 'get_recent_transactions'
-        ) {
-          out = await runWalletTool(name, tu.input, wallet, snapshotIso)
-        } else if (name === 'send_eth' || name === 'send_token') {
-          const intent = parseToolTxIntent([
-            { type: 'tool_use', name: tu.name, input: tu.input },
-          ] as unknown[])
-          if (intent) pendingSendIntent = intent
-          out = JSON.stringify({ ok: true, note: 'Transfer intent recorded; user will confirm in the app.' })
-        } else {
-          out = JSON.stringify({ error: `Unknown tool: ${name}` })
-        }
+        const out = await executeToolCall(name, tu.input, wallet, snapshotIso, (intent) => {
+          pendingSendIntent = intent
+        })
         results.push({ type: 'tool_result', tool_use_id: id, content: out })
       } catch (e: any) {
         results.push({
@@ -318,9 +338,103 @@ export async function chat(
     apiMessages.push({ role: 'user', content: results })
   }
 
-  const txIntent = parseToolTxIntent(lastContent) ?? pendingSendIntent
-  return {
-    reply: 'Too many tool rounds; try a simpler question.',
-    txIntent,
+  return finalReply('Too many tool rounds; try a simpler question.', parseToolTxIntent(lastCalls) ?? pendingSendIntent)
+}
+
+// ─── Gemini provider ────────────────────────────────────────────────────────
+
+/** Anthropic-style JSON-schema tool defs → Gemini's uppercase-typed Schema. */
+function toGeminiSchema(s: any): any {
+  if (!s || typeof s !== 'object') return s
+  const out: any = {}
+  if (s.type) out.type = String(s.type).toUpperCase()
+  if (s.description) out.description = s.description
+  if (s.properties) {
+    out.properties = {}
+    for (const [k, v] of Object.entries(s.properties)) out.properties[k] = toGeminiSchema(v)
   }
+  if (s.required) out.required = s.required
+  if (s.items) out.items = toGeminiSchema(s.items)
+  return out
+}
+
+const GEMINI_TOOLS = [
+  {
+    functionDeclarations: ALL_TOOLS.map((t) => ({
+      name: t.name,
+      description: t.description,
+      parameters: toGeminiSchema((t as any).input_schema),
+    })),
+  },
+]
+
+async function chatWithGemini(
+  messages: ChatMessage[],
+  wallet: WalletData,
+  snapshotUpdatedAt: Date
+): Promise<ChatResponse> {
+  const snapshotIso = snapshotUpdatedAt.toISOString()
+  const systemPrompt = buildMinimalSystemPrompt(wallet.address, snapshotIso)
+
+  const contents: any[] = messages.map((m) => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }],
+  }))
+
+  let lastCalls: ToolCall[] = []
+  let pendingSendIntent: SendTxIntent | undefined
+  const maxRounds = 8
+
+  for (let round = 0; round < maxRounds; round++) {
+    const response = await geminiClient.models.generateContent({
+      model: GEMINI_MODEL,
+      contents,
+      config: {
+        systemInstruction: systemPrompt,
+        tools: GEMINI_TOOLS,
+        maxOutputTokens: 2048,
+      },
+    })
+
+    const calls = response.functionCalls ?? []
+    lastCalls = calls.map((c) => ({ name: c.name ?? '', input: c.args ?? {} }))
+
+    if (calls.length === 0) {
+      const reply = (response.text ?? '').trim()
+      return finalReply(reply, parseToolTxIntent(lastCalls) ?? pendingSendIntent)
+    }
+
+    const modelContent = response.candidates?.[0]?.content
+    if (modelContent) contents.push(modelContent)
+
+    const responseParts: any[] = []
+    for (const call of calls) {
+      const name = call.name ?? ''
+      try {
+        const out = await executeToolCall(name, call.args ?? {}, wallet, snapshotIso, (intent) => {
+          pendingSendIntent = intent
+        })
+        responseParts.push({ functionResponse: { name, id: call.id, response: { result: out } } })
+      } catch (e: any) {
+        responseParts.push({
+          functionResponse: { name, id: call.id, response: { error: e?.message ?? 'Tool error' } },
+        })
+      }
+    }
+
+    contents.push({ role: 'user', parts: responseParts })
+  }
+
+  return finalReply('Too many tool rounds; try a simpler question.', parseToolTxIntent(lastCalls) ?? pendingSendIntent)
+}
+
+// ─── Provider dispatch ──────────────────────────────────────────────────────
+
+export async function chat(
+  messages: ChatMessage[],
+  wallet: WalletData,
+  snapshotUpdatedAt: Date
+): Promise<ChatResponse> {
+  if (AI_PROVIDER === 'anthropic') return chatWithAnthropic(messages, wallet, snapshotUpdatedAt)
+  return chatWithGemini(messages, wallet, snapshotUpdatedAt)
 }
