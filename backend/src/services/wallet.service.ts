@@ -15,12 +15,14 @@ dotenv.config()
 
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY ?? ''
 const DUNE_SIM_API_KEY = process.env.DUNE_SIM_API_KEY ?? ''
+const ZERION_API_KEY = process.env.ZERION_API_KEY ?? ''
 const MORALIS_BASE = 'https://deep-index.moralis.io/api/v2.2'
 const DUNE_SIM_BASE = 'https://api.sim.dune.com/v1/evm'
+const ZERION_BASE = 'https://api.zerion.io'
 
 const NATIVE_ETH_PLACEHOLDER = '0x0000000000000000000000000000000000000000' as const
 
-// ─── Dune chain display name mapping ─────────────────────────────────────────
+// ─── Dune chain display name mapping (transactions only) ────────────────────
 
 const DUNE_CHAIN_DISPLAY: Record<string, string> = {
   ethereum:    'Ethereum',
@@ -38,8 +40,22 @@ const DUNE_CHAIN_DISPLAY: Record<string, string> = {
   mantle:      'Mantle',
 }
 
-// chains to query — covers the most active EVMs
-const BALANCE_CHAIN_IDS = '1,137,56,42161,10,8453,43114'
+// ─── Zerion chain slug mapping (balances) ────────────────────────────────────
+// Zerion identifies chains by slug rather than numeric chain_id.
+// https://developers.zerion.io/reference/listwalletpositions
+
+const ZERION_CHAIN: Record<string, { chainId: number; display: string }> = {
+  ethereum:               { chainId: 1,     display: 'Ethereum' },
+  polygon:                { chainId: 137,   display: 'Polygon' },
+  'binance-smart-chain':  { chainId: 56,    display: 'BSC' },
+  arbitrum:               { chainId: 42161, display: 'Arbitrum' },
+  optimism:               { chainId: 10,    display: 'Optimism' },
+  base:                   { chainId: 8453,  display: 'Base' },
+  avalanche:              { chainId: 43114, display: 'Avalanche' },
+}
+
+const ZERION_CHAIN_SLUGS = Object.keys(ZERION_CHAIN).join(',')
+
 
 function chunk<T>(arr: T[], size: number): T[][] {
   const out: T[][] = []
@@ -75,6 +91,22 @@ async function duneFetch(path: string): Promise<any> {
   return res.json()
 }
 
+// ─── Zerion helpers (balances) ───────────────────────────────────────────────
+// Zerion uses HTTP Basic auth: base64("<api-key>:") — no password.
+
+async function zerionFetch(path: string): Promise<any> {
+  if (!ZERION_API_KEY) throw new Error('ZERION_API_KEY not set')
+  const token = Buffer.from(`${ZERION_API_KEY}:`).toString('base64')
+  const res = await fetch(`${ZERION_BASE}${path}`, {
+    headers: { Authorization: `Basic ${token}`, accept: 'application/json' },
+  })
+  if (!res.ok) {
+    const txt = await res.text()
+    throw new Error(`Zerion ${path}: ${res.status} ${txt}`)
+  }
+  return res.json()
+}
+
 // ─── ENS Name ───────────────────────────────────────────────────────────────
 
 async function getEnsName(address: string): Promise<string | undefined> {
@@ -86,56 +118,68 @@ async function getEnsName(address: string): Promise<string | undefined> {
   }
 }
 
-// ─── Dune SIM: all-chain balances in one call ────────────────────────────────
+// ─── Zerion: all-chain balances in one call ──────────────────────────────────
+// Replaces the retired Dune Sim balances endpoint.
+// https://developers.zerion.io/reference/listwalletpositions
 
-async function getDuneBalances(address: string): Promise<{
+async function getZerionBalances(address: string): Promise<{
   nativeBalances: NativeBalance[]
   tokens: TokenBalance[]
   ethPriceUsd: number
 }> {
-  const data = await duneFetch(
-    `/balances/${address}?chain_ids=${BALANCE_CHAIN_IDS}&metadata=logo&exclude_spam_tokens=true&historical_prices=24&limit=1000`
-  )
+  const qs = new URLSearchParams({
+    currency: 'usd',
+    'filter[positions]': 'only_simple',
+    'filter[chain_ids]': ZERION_CHAIN_SLUGS,
+  })
+  const data = await zerionFetch(`/v1/wallets/${address}/positions/?${qs}`)
 
-  const balances: any[] = data.balances ?? []
+  const positions: any[] = data.data ?? []
   const nativeBalances: NativeBalance[] = []
   const tokens: TokenBalance[] = []
   let ethPriceUsd = 2500
 
-  for (const b of balances) {
-    const chainDisplay = DUNE_CHAIN_DISPLAY[b.chain as string] ?? (b.chain as string) ?? 'Unknown'
-    const chainId: number = b.chain_id ?? 0
-    const decimals: number = b.decimals ?? 18
-    const rawAmt = BigInt(b.amount ?? '0')
-    const balance = (Number(rawAmt) / Math.pow(10, decimals)).toFixed(6)
-    const balanceUsd: number = b.value_usd ?? 0
+  for (const pos of positions) {
+    const attr = pos.attributes
+    const fungible = attr?.fungible_info
+    const slug = pos.relationships?.chain?.data?.id
+    if (!attr || !fungible || !slug) continue
 
-    // 24h price change from historical_prices[0] (24h ago)
-    const price24hAgo: number | undefined = b.historical_prices?.[0]?.price_usd
-    const change24h =
-      b.price_usd != null && price24hAgo != null && price24hAgo > 0
-        ? ((b.price_usd - price24hAgo) / price24hAgo) * 100
-        : undefined
+    const mapped = ZERION_CHAIN[slug as string]
+    if (!mapped) continue // unsupported chain — dropped
 
-    if (b.address === 'native') {
-      if (chainId === 1 && b.price_usd) ethPriceUsd = b.price_usd
+    const chainDisplay = mapped.display
+    const chainId = mapped.chainId
+    const decimals: number = attr.quantity?.decimals ?? 18
+    const balance = Number(attr.quantity?.float ?? 0).toFixed(6)
+    const balanceUsd: number = attr.value ?? 0
+    const priceUsd: number | undefined = attr.price ?? undefined
+    const change24h: number | undefined = attr.changes?.percent_1d ?? undefined
+
+    const impls = fungible.implementations ?? []
+    const impl = impls.find((i: any) => i.chain_id === slug) ?? impls[0]
+    // A null implementation address denotes the chain's native coin.
+    const tokenAddress: string = impl?.address ?? 'native'
+
+    if (tokenAddress === 'native') {
+      if (chainId === 1 && priceUsd) ethPriceUsd = priceUsd
       nativeBalances.push({
         chain: chainDisplay,
         chainId,
-        symbol: b.symbol ?? '?',
+        symbol: fungible.symbol ?? '?',
         name: chainDisplay,
         balance,
         balanceUsd,
       })
     } else {
       tokens.push({
-        symbol: b.symbol ?? 'UNKNOWN',
-        name: b.name ?? b.symbol ?? 'Unknown Token',
+        symbol: fungible.symbol ?? 'UNKNOWN',
+        name: fungible.name ?? fungible.symbol ?? 'Unknown Token',
         balance,
         decimals,
         usdValue: balanceUsd,
-        contractAddress: b.address,
-        logo: b.logo,
+        contractAddress: tokenAddress,
+        logo: fungible.icon?.url ?? undefined,
         change24h,
         chain: chainDisplay,
         chainId,
@@ -143,7 +187,7 @@ async function getDuneBalances(address: string): Promise<{
     }
   }
 
-  console.log(`[dune-balances] ${nativeBalances.length} native, ${tokens.length} ERC-20 tokens, ETH=$${ethPriceUsd}`)
+  console.log(`[zerion-balances] ${nativeBalances.length} native, ${tokens.length} ERC-20 tokens, ETH=$${ethPriceUsd}`)
 
   return {
     nativeBalances,
@@ -379,13 +423,13 @@ function analyzeRisk(
 export async function fetchWalletData(address: string): Promise<WalletData> {
   const [ensName, balanceData, nfts] = await Promise.all([
     getEnsName(address),
-    getDuneBalances(address),
+    getZerionBalances(address),
     getNFTs(address),
   ])
 
   const { nativeBalances, tokens, ethPriceUsd } = balanceData
 
-  // Fetch transactions with the live ETH price from Dune
+  // Fetch transactions (Dune SIM) with the live ETH price from Zerion
   const transactions = await getTransactions(address, ethPriceUsd)
 
   // Ethereum mainnet native balance (for backward compat fields)

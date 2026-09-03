@@ -47,7 +47,7 @@ export async function refreshWalletSnapshot(address: string): Promise<WalletData
   refreshing.add(addr)
   try {
     if (process.env.WALLET_LOG_INDEXER === '1') {
-      console.log('[wallet-indexer] calling Dune/Moralis fetch for', addr)
+      console.log('[wallet-indexer] calling Zerion/Moralis fetch for', addr)
     }
     const wallet = await fetchWalletData(address)
     await prisma.walletSnapshot.upsert({
