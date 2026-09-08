@@ -5,7 +5,6 @@ import type { ChatMessage, ChatResponse, SendTxIntent, MarketContext, WalletData
 import { fetchMarketContext } from './market.service.js'
 import { isValidEvmAddress, isPositiveDecimal } from '../utils/tx-builder.js'
 import { buildSystemPrompt } from '../prompts/system-prompt.js'
-import { SEND_ETH_TOOL, SEND_TOKEN_TOOL } from '../prompts/tools.js'
 import dotenv from 'dotenv'
 
 dotenv.config({ override: true })

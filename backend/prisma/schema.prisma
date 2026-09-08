@@ -12,3 +12,53 @@ model WalletSnapshot {
   payload   Json
   updatedAt DateTime @updatedAt
 }
+
+model UserCredit {
+  address      String             @id
+  creditsTotal Int                @default(100)
+  creditsUsed  Int                @default(0)
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+  usageEvents  CreditUsageEvent[]
+
+  @@index([updatedAt])
+}
+
+model CreditUsageEvent {
+  id        String   @id @default(cuid())
+  address   String
+  cost      Int
+  reason    String
+  requestId String   @unique
+  createdAt DateTime @default(now())
+  account   UserCredit @relation(fields: [address], references: [address], onDelete: Cascade)
+
+  @@index([address, createdAt])
+}
+
+model ChatThread {
+  id        String        @id @default(cuid())
+  address   String
+  title     String?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  messages  ChatMessage[]
+
+  @@index([address, updatedAt])
+}
+
+model ChatMessage {
+  id        String    @id @default(cuid())
+  threadId  String
+  role      ChatRole
+  content   String
+  createdAt DateTime  @default(now())
+  thread    ChatThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@index([threadId, createdAt])
+}
+
+enum ChatRole {
+  user
+  assistant
+}

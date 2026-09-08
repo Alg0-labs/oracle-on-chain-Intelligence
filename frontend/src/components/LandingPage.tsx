@@ -220,11 +220,14 @@ const ROW2 = [...NETWORKS.slice(8, 16), ...NETWORKS.slice(8, 16)]
 
 interface Props {
   onConnect: () => void
+  whaleWallets: Array<{ label: string; address: string }>
+  onExploreWallet: (address: string) => void
 }
 
-export function LandingPage({ onConnect }: Props) {
+export function LandingPage({ onConnect, whaleWallets, onExploreWallet }: Props) {
   const { theme, toggle } = useTheme()
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768)
+  const [selectedWallet, setSelectedWallet] = useState('')
   useEffect(() => {
     const fn = () => setIsMobile(window.innerWidth < 768)
     window.addEventListener('resize', fn)
@@ -299,6 +302,33 @@ export function LandingPage({ onConnect }: Props) {
             <span style={{ fontSize: 11, color: 'var(--text-5)' }}>
               Non-custodial · Read-only
             </span>
+          </div>
+
+          <div style={exploreCard}>
+            <div style={{ fontSize: 11, color: 'var(--text-5)', marginBottom: 6, letterSpacing: '0.03em' }}>
+              EXPLORE POPULAR WALLETS
+            </div>
+            <div style={{ display: 'flex', flexDirection: isMobile ? 'column' : 'row', gap: 8 }}>
+              <select
+                value={selectedWallet}
+                onChange={(event) => setSelectedWallet(event.target.value)}
+                style={presetSelect}
+              >
+                <option value="">Select a whale wallet</option>
+                {whaleWallets.map((wallet) => (
+                  <option key={wallet.address} value={wallet.address}>
+                    {wallet.label} ({wallet.address.slice(0, 6)}...{wallet.address.slice(-4)})
+                  </option>
+                ))}
+              </select>
+              <button
+                style={{ ...connectBtnNav, opacity: selectedWallet ? 1 : 0.45 }}
+                disabled={!selectedWallet}
+                onClick={() => selectedWallet && onExploreWallet(selectedWallet)}
+              >
+                Explore
+              </button>
+            </div>
           </div>
 
           {/* Feature pills */}
@@ -395,6 +425,28 @@ const connectBtnNav: React.CSSProperties = {
   fontFamily: 'var(--font-body)',
   cursor: 'pointer',
   letterSpacing: '-0.01em',
+}
+
+const exploreCard: React.CSSProperties = {
+  width: '100%',
+  maxWidth: 460,
+  background: 'var(--bg-card)',
+  border: '1px solid var(--border)',
+  borderRadius: 10,
+  padding: '10px 12px',
+  marginBottom: 20,
+}
+
+const presetSelect: React.CSSProperties = {
+  flex: 1,
+  background: 'var(--bg)',
+  border: '1px solid var(--border-sub)',
+  borderRadius: 8,
+  color: 'var(--text)',
+  fontSize: 13,
+  fontFamily: 'var(--font-body)',
+  padding: '0 12px',
+  height: 34,
 }
 
 const main: React.CSSProperties = {

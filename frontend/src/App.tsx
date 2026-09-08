@@ -9,7 +9,7 @@ import { TransactionsPanel } from './components/TransactionsPanel.js'
 import { Sidebar } from './components/Sidebar.js'
 import type { Page } from './components/Sidebar.js'
 import { LandingPage } from './components/LandingPage.js'
-import { fetchWallet, fetchMarket, refreshWallet } from './lib/api.js'
+import { fetchWallet, fetchMarket, refreshWallet, fetchWalletPresets } from './lib/api.js'
 import { useTheme } from './lib/theme.js'
 import type { WalletData, MarketData } from './types/index.js'
 
@@ -29,6 +29,10 @@ export default function App() {
   const [refreshError, setRefreshError]           = useState<string | null>(null)
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [selectedPresetAddress, setSelectedPresetAddress] = useState<string | null>(null)
+  const [walletPresets, setWalletPresets] = useState<Array<{ label: string; address: string }>>([])
+  const isAnonymousPreset = !isConnected && !!selectedPresetAddress
+  const activeAddress = isConnected ? address ?? null : selectedPresetAddress
 
   useEffect(() => {
     const fn = () => {
@@ -41,14 +45,14 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (!address || !isConnected) {
+    if (!activeAddress) {
       setWallet(null); setMarket(null); setSnapshotUpdatedAt(null)
       setLoading(false); setError(null)
       return
     }
     let cancelled = false
     setLoading(true); setError(null)
-    Promise.all([fetchWallet(address), fetchMarket(address)])
+    Promise.all([fetchWallet(activeAddress), fetchMarket(activeAddress)])
       .then(([wRes, marketData]) => {
         if (cancelled) return
         setWallet(wRes.wallet)
@@ -58,16 +62,22 @@ export default function App() {
       .catch(err => { if (!cancelled) setError(err.message ?? 'Failed to load wallet') })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
-  }, [address, isConnected])
+  }, [activeAddress])
+
+  useEffect(() => {
+    fetchWalletPresets()
+      .then((wallets) => setWalletPresets(wallets))
+      .catch(() => setWalletPresets([]))
+  }, [])
 
   const handleRefresh = () => {
-    if (!address || refreshing) return
+    if (!activeAddress || refreshing || isAnonymousPreset) return
     setRefreshing(true); setRefreshError(null)
-    refreshWallet(address)
+    refreshWallet(activeAddress)
       .then(wRes => {
         setWallet(wRes.wallet)
         setSnapshotUpdatedAt(wRes.snapshotUpdatedAt)
-        return fetchMarket(address)
+        return fetchMarket(activeAddress)
       })
       .then(md => setMarket(md))
       .catch(err => setRefreshError(err.message ?? 'Refresh failed'))
@@ -75,8 +85,14 @@ export default function App() {
   }
 
   // ── Landing ──────────────────────────────────────────────────────────────────
-  if (!isConnected) {
-    return <LandingPage onConnect={() => open()} />
+  if (!isConnected && !selectedPresetAddress) {
+    return (
+      <LandingPage
+        onConnect={() => open()}
+        whaleWallets={walletPresets}
+        onExploreWallet={(walletAddress) => setSelectedPresetAddress(walletAddress)}
+      />
+    )
   }
 
   // ── Loading ──────────────────────────────────────────────────────────────────
@@ -85,7 +101,7 @@ export default function App() {
       <div style={stateRoot}>
         <div style={loadingCenter}>
           <div style={spinner} />
-          <p style={loadTitle}>Indexing {address?.slice(0, 10)}…</p>
+          <p style={loadTitle}>Indexing {activeAddress?.slice(0, 10)}…</p>
           <p style={loadSub}>Fetching balances, tokens & transactions</p>
         </div>
       </div>
@@ -129,7 +145,7 @@ export default function App() {
         page={page}
         setPage={(p) => { setPage(p); if (isMobile) setSidebarOpen(false) }}
         wallet={wallet}
-        address={address}
+        address={activeAddress ?? undefined}
         theme={theme}
         onToggleTheme={toggle}
         isMobile={isMobile}
@@ -152,8 +168,8 @@ export default function App() {
         <button
           style={refreshTopBtn}
           onClick={handleRefresh}
-          disabled={refreshing}
-          title="Refresh portfolio data"
+          disabled={refreshing || isAnonymousPreset}
+          title={isAnonymousPreset ? 'Refresh requires connected wallet mode' : 'Refresh portfolio data'}
         >
           <svg
             width="13" height="13" viewBox="0 0 16 16" fill="none"
@@ -164,7 +180,19 @@ export default function App() {
           </svg>
           {refreshing ? 'Syncing…' : 'Refresh'}
         </button>
-        <w3m-button size="sm" />
+        {isConnected ? (
+          <w3m-button size="sm" />
+        ) : (
+          <button
+            style={refreshTopBtn}
+            onClick={() => {
+              setSelectedPresetAddress(null)
+              open()
+            }}
+          >
+            Connect Wallet
+          </button>
+        )}
       </div>
 
       {/* Main area (offset by sidebar) */}
@@ -192,6 +220,8 @@ export default function App() {
             address={wallet.address}
             snapshotUpdatedAt={snapshotUpdatedAt}
             onWalletRefresh={handleRefresh}
+            canChat={isConnected || isAnonymousPreset}
+            anonymousMode={isAnonymousPreset}
           />
         )}
         {page === 'transactions' && (

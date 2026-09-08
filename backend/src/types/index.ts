@@ -123,6 +123,8 @@ export type SendTxIntent = SendEthIntent | SendTokenIntent
 export interface ChatResponse {
   reply: string
   txIntent?: SendTxIntent // if user wants to send funds
+  threadId?: string
+  remainingCredits?: number
 }
 
 export interface FearGreedData {
